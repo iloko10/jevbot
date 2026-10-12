@@ -26,9 +26,13 @@ pre{white-space:pre-wrap;font-size:12px;margin:0}
 <div class="mute" id="sub">loading…</div>
 <div class="grid" id="tiles"></div>
 <div class="card"><canvas id="eq" height="90"></canvas></div>
+<div class="card" style="margin-top:10px"><div class="k">Fees check: does each spread earn more than it pays? (same live market, same decisions)</div>
+<div style="overflow-x:auto"><table id="feetab"></table></div>
+<div class="mute" style="font-size:12px;margin-top:6px">1 bps = 1 cent per $100 traded. "Earned" is before fees. The book wins only if Earned &gt; Fees.
+Fee tier follows Hyperliquid's real schedule (lower fees after $5M / $25M / $100M of 14-day volume).</div></div>
 <div class="two" style="margin-top:10px">
  <div class="card"><div class="k">Latest judgments</div><pre id="ans"></pre></div>
- <div class="card"><div class="k">Recent fills</div><table id="fills"></table></div>
+ <div class="card"><div class="k">Recent fills (main book)</div><table id="fills"></table></div>
 </div>
 <div class="card" style="margin-top:10px"><div class="k">Events (kill switch, Jev down/up)</div><table id="events"></table></div>
 </main><script>
@@ -45,6 +49,10 @@ async function load(){
  ['Fills / posted',`${S.fills||0} / ${S.posted||0}`],['Rejects',S.rejects||0]];
  document.getElementById('tiles').innerHTML=t.map(([k,v,g])=>`<div class="card"><div class="k">${k}</div><div class="v ${g===true?'good':g===false?'bad':''}">${v}</div></div>`).join('');
  document.getElementById('ans').textContent=(L.reason?('why: '+L.reason+'\\n\\n'):'')+JSON.stringify(L.answers||{},(k,v)=>typeof v==='number'?Math.round(v*1000)/1000:v,1);
+ const bk=s.books||[];
+ const verdict=b=>!b.fills?'<span class="mute">no fills yet</span>':b.net_bps>0?'<span class="good">beats fees</span>':b.earned_bps>0?'<span class="bad">loses to fees</span>':'<span class="bad">loses even before fees</span>';
+ document.getElementById('feetab').innerHTML='<tr><th>Book</th><th>Spread</th><th>Fills</th><th>Volume $</th><th>Earned bps</th><th>Fees bps</th><th>Net bps</th><th>PnL $</th><th>Fee tier</th><th>Result</th></tr>'+
+  bk.map(b=>`<tr><td>${b.book}${b.killed?' <span class="bad">(stopped today)</span>':''}</td><td>${b.half_spread_bps} bps</td><td>${b.fills}</td><td>${Math.round(b.volume).toLocaleString()}</td><td>${f(b.earned_bps)}</td><td>${f(b.fee_bps)}</td><td class="${b.net_bps>0?'good':b.net_bps<0?'bad':''}">${f(b.net_bps)}</td><td class="${b.pnl>=0?'good':'bad'}">${f(b.pnl)}</td><td>${b.tier} (${f(b.maker_fee_bps,2)} bps)</td><td>${verdict(b)}</td></tr>`).join('');
  const fl=await (await fetch('api/fills?n=15')).json();
  document.getElementById('fills').innerHTML='<tr><th>time</th><th>side</th><th>px</th><th>size</th><th>maker</th></tr>'+fl.map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString()}</td><td>${x.side}</td><td>${f(x.px,0)}</td><td>${f(x.sz,4)}</td><td>${x.maker?'yes':'TAKER'}</td></tr>`).join('');
  const ev=await (await fetch('api/events')).json();
@@ -99,7 +107,14 @@ def create_app(engine, cfg):
     @app.get("/api/fills")
     def fills():
         n = int(request.args.get("n", 50))
-        return jsonify(q("SELECT * FROM fills ORDER BY ts DESC LIMIT ?", (n,)))
+        book = request.args.get("book", "main")
+        return jsonify(q("SELECT * FROM fills WHERE book = ? ORDER BY ts DESC LIMIT ?", (book, n)))
+
+    @app.get("/api/books")
+    def books():
+        """Fee check history: one row per book per minute."""
+        hours = float(request.args.get("hours", 24))
+        return jsonify(q("SELECT * FROM book_stats WHERE ts > ? ORDER BY ts", (time.time() - hours * 3600,)))
 
     @app.get("/api/events")
     def events():

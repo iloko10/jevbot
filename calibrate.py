@@ -19,7 +19,13 @@ def load(path):
     db.row_factory = sqlite3.Row
     dec = db.execute("SELECT ts, source, model, mid, equity, snapshot, answers FROM decisions WHERE answers != '{}' ORDER BY ts").fetchall()
     fills = db.execute("SELECT * FROM fills ORDER BY ts").fetchall()
-    return dec, fills
+    try:  # last fee-check row per book
+        books = db.execute("""SELECT b.* FROM book_stats b
+            JOIN (SELECT book, MAX(ts) AS ts FROM book_stats GROUP BY book) l ON b.book = l.book AND b.ts = l.ts
+            ORDER BY b.half_spread_bps""").fetchall()
+    except sqlite3.OperationalError:
+        books = []
+    return dec, fills, books
 
 
 def future_mid(ts_list, mids, t):
@@ -43,7 +49,7 @@ def ece(pairs, bins=10):
     return e, table
 
 
-def report(dec, fills, horizon):
+def report(dec, fills, books, horizon):
     ts_list = [r["ts"] for r in dec]
     mids = [r["mid"] for r in dec]
     by_source = defaultdict(lambda: {"brier": [], "logloss": [], "top": [], "toxic": []})
@@ -87,21 +93,45 @@ def report(dec, fills, horizon):
             base = sum(y for _, y in tx) / len(tx)
             print(f"  toxic_flow Brier={brier_t:.4f}  (constant-rate baseline={base*(1-base):.4f}, base rate={base:.3f})")
 
-    print(f"\n=== Fills ({len(fills)}) ===")
-    if fills:
+    print(f"\n=== Fills per book ({len(fills)} total) ===")
+    groups = defaultdict(list)
+    for f in fills:
+        groups[f["book"] if "book" in f.keys() else "main"].append(f)
+    for name, fl in groups.items():
         adv = []
-        for f in fills:
+        for f in fl:
             fm = future_mid(ts_list, mids, f["ts"] + 10)
             if fm is None:
                 continue
             sign = 1 if f["side"] == "bid" else -1
             adv.append(sign * (fm - f["px"]) / f["px"] * 1e4)  # >0 good, <0 = we got picked off
-        maker = sum(1 for f in fills if f["maker"])
-        fees = sum(f["fee"] for f in fills)
-        print(f"  maker fills={maker}  taker fills={len(fills)-maker}  fees=${fees:.2f}")
+        maker = sum(1 for f in fl if f["maker"])
+        vol = sum(f["px"] * f["sz"] for f in fl)
+        fees = sum(f["fee"] for f in fl)
+        line = f"  [{name}] fills={len(fl)} (taker {len(fl) - maker})  volume=${vol:,.0f}  fees=${fees:.2f}"
         if adv:
-            print(f"  avg markout after 10s = {sum(adv)/len(adv):+.2f} bps per fill "
-                  f"(negative = adverse selection: we buy before drops / sell before pumps)")
+            line += (f"  | markout after 10s {sum(adv)/len(adv):+.2f} bps vs fee {fees/vol*1e4:.2f} bps"
+                     if vol else "")
+        print(line)
+    print("  (markout = what a fill is worth 10s later. It must be bigger than the fee, or the book loses.)")
+
+    if books:
+        print("\n=== Fees check (latest, per $ traded) ===")
+        print("  book              spread  fills    volume$   earned  fees   net    PnL$    tier  result")
+        for b in books:
+            if not b["fills"]:
+                res = "no fills yet"
+            elif (b["net_bps"] or 0) > 0:
+                res = "beats fees"
+            elif (b["earned_bps"] or 0) > 0:
+                res = "loses to fees"
+            else:
+                res = "loses even before fees"
+            fmt = lambda x: f"{x:+.2f}" if x is not None else "  -  "
+            print(f"  {b['book']:<17} {b['half_spread_bps']:>4g}bp {b['fills']:>6} {b['volume']:>11,.0f}  "
+                  f"{fmt(b['earned_bps'])}  {fmt(b['fee_bps'])}  {fmt(b['net_bps'])}  {b['pnl']:>+7.2f}  "
+                  f"{b['tier']:>3}   {res}{'  (stopped by kill switch)' if b['killed'] else ''}")
+        print("  bps = cents per $100 traded. 'earned' is before fees.")
     if dec:
         hrs = (dec[-1]['ts'] - dec[0]['ts']) / 3600
         print(f"\n=== Equity ===\n  {dec[0]['equity']:.2f} -> {dec[-1]['equity']:.2f} "

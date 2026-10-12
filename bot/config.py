@@ -53,7 +53,14 @@ class Config:
 
     # Paper exchange
     quote_size: float = field(default_factory=lambda: _f("QUOTE_SIZE", 0.002))
-    maker_fee_bps: float = field(default_factory=lambda: _f("MAKER_FEE_BPS", 1.5))
+    # Fees: Hyperliquid tier is picked automatically from the bot's own 14-day volume (see paper.py).
+    # FEE_DISCOUNT = HYPE staking discount as a fraction (0.05 = 5% for >10 HYPE staked).
+    # MAKER_FEE_BPS forces a fixed maker fee, only for "what if" tests.
+    fee_discount: float = field(default_factory=lambda: _f("FEE_DISCOUNT", 0.0))
+    maker_fee_override: str = field(default_factory=lambda: os.getenv("MAKER_FEE_BPS", ""))
+    # Spread tests: extra paper books that quote wider, on the SAME live data and the SAME judgments.
+    # Shows which spread actually beats the fees. Empty = off.
+    spread_tests_bps: str = field(default_factory=lambda: os.getenv("SPREAD_TESTS_BPS", "3,5,8"))
     fill_on_touch: bool = field(default_factory=lambda: _b("FILL_ON_TOUCH", False))  # False = only fill when price trades THROUGH us
     min_rest_ms: int = field(default_factory=lambda: _i("MIN_REST_MS", 2000))  # don't cancel/replace faster than this unless price moved
     requote_bps: float = field(default_factory=lambda: _f("REQUOTE_BPS", 1.0))

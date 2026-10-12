@@ -14,9 +14,14 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS ix_dec_ts ON decisions(ts);
 CREATE TABLE IF NOT EXISTS fills (
-  ts REAL, side TEXT, px REAL, sz REAL, fee REAL, maker INTEGER, mid REAL
+  ts REAL, side TEXT, px REAL, sz REAL, fee REAL, maker INTEGER, mid REAL, book TEXT DEFAULT 'main'
 );
+CREATE INDEX IF NOT EXISTS ix_fills_book_ts ON fills(book, ts);
 CREATE TABLE IF NOT EXISTS events (ts REAL, kind TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS book_stats (
+  ts REAL, book TEXT, half_spread_bps REAL, pnl REAL, fees REAL, volume REAL, fills INTEGER,
+  earned_bps REAL, fee_bps REAL, net_bps REAL, tier INTEGER, maker_fee_bps REAL, inventory REAL, killed INTEGER
+);
 """
 
 
@@ -27,6 +32,10 @@ class Store:
         self.lock = threading.Lock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
+        try:  # older databases: fills had no book column
+            self.db.execute("ALTER TABLE fills ADD COLUMN book TEXT DEFAULT 'main'")
+        except sqlite3.OperationalError:
+            pass
         self.db.executescript(SCHEMA)
         self._last_prune = 0.0
 
@@ -44,9 +53,24 @@ class Store:
 
     def fill(self, f):
         with self.lock:
-            self.db.execute("INSERT INTO fills VALUES (?,?,?,?,?,?,?)",
-                            (f.ts, f.side, f.px, f.sz, f.fee, int(f.maker), f.mid_at_fill))
+            self.db.execute("INSERT INTO fills (ts, side, px, sz, fee, maker, mid, book) VALUES (?,?,?,?,?,?,?,?)",
+                            (f.ts, f.side, f.px, f.sz, f.fee, int(f.maker), f.mid_at_fill, f.book))
             self.db.commit()
+
+    def book_stats(self, ts, summaries):
+        cols = ("half_spread_bps", "pnl", "fees", "volume", "fills", "earned_bps", "fee_bps", "net_bps",
+                "tier", "maker_fee_bps", "inventory", "killed")
+        with self.lock:
+            self.db.executemany(
+                "INSERT INTO book_stats VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [(ts, s["book"], *[s[c] for c in cols]) for s in summaries])
+            self.db.commit()
+
+    def volume_since(self, book, since_ts):
+        """[(ts, notional)] of a book's fills, used to restore the 14-day fee tier after a restart."""
+        with self.lock:
+            return self.db.execute("SELECT ts, px * sz FROM fills WHERE book = ? AND ts >= ? ORDER BY ts",
+                                   (book, since_ts)).fetchall()
 
     def event(self, kind, detail=""):
         with self.lock:

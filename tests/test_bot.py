@@ -226,3 +226,85 @@ async def test_kill_switch(cfg):
     assert row["action"] == KILL         # stays off
     ev = eng.store.db.execute("SELECT kind FROM events").fetchall()
     assert ("kill",) in ev
+
+
+# ---------------- fees: tiers, discount, earned vs fees ----------------
+from bot.engine import parse_spread_tests
+from bot.paper import fee_tier
+
+
+def test_fee_tiers_match_hyperliquid_schedule():
+    assert fee_tier(0) == (0, 1.5, 4.5)
+    assert fee_tier(5e6) == (0, 1.5, 4.5)          # must be MORE than $5M
+    assert fee_tier(6e6) == (1, 1.2, 4.0)
+    assert fee_tier(3e7) == (2, 0.8, 3.5)
+    assert fee_tier(2e8) == (3, 0.4, 3.0)
+    assert fee_tier(6e8)[1] == 0.0                   # tier 4+: zero maker fee
+
+
+def test_fee_tier_changes_once_per_day_and_discount(cfg):
+    cfg.fee_discount = 0.05                          # >10 HYPE staked
+    p = PaperExchange(cfg)
+    assert p.maker_bps == pytest.approx(1.425)
+    day1 = 1_760_000_000.0
+    p.mark(100_000, day1)
+    p.seed_volume([(day1 - 3600, 6e6)])              # $6M traded in the last 14 days
+    assert p.tier == 1                               # seeding (restart) applies right away
+    p2 = PaperExchange(cfg)
+    p2.mark(100_000, day1)
+    p2._apply("bid", 100_000, 30.0, day1, maker=True, mid=100_000)   # $3M
+    p2._apply("ask", 100_000, 30.0, day1, maker=True, mid=100_000)   # $3M
+    assert p2.tier == 0                              # same day: no change yet
+    p2.mark(100_000, day1 + 86400)                   # next UTC day: re-assessed
+    assert p2.tier == 1 and p2.maker_bps == pytest.approx(1.2 * 0.95)
+    p2.mark(100_000, day1 + 16 * 86400)              # volume older than 14 days drops out
+    assert p2.tier == 0
+
+
+def test_summary_splits_earned_and_fees(cfg):
+    p = PaperExchange(cfg)
+    p._apply("bid", 99_980, 0.01, 1, maker=True, mid=100_000)        # buy 2 bps under mid
+    p._apply("ask", 100_020, 0.01, 2, maker=True, mid=100_000)       # sell 2 bps over mid
+    s = p.summary(100_000)
+    assert s["fills"] == 2 and s["volume"] == pytest.approx(2000, abs=1)
+    assert s["pnl_before_fees"] == pytest.approx(0.40, abs=1e-6)     # $0.40 spread captured
+    assert s["fee_bps"] == pytest.approx(1.5, abs=0.01)
+    assert s["earned_bps"] == pytest.approx(2.0, abs=0.01)           # 0.40 / 2000
+    assert s["net_bps"] == pytest.approx(0.5, abs=0.01)
+
+
+def test_parse_spread_tests():
+    assert parse_spread_tests("3, 5,8", 2.0) == [3.0, 5.0, 8.0]
+    assert parse_spread_tests("2,3,3", 2.0) == [3.0]                 # skips the main spread and repeats
+    assert parse_spread_tests("", 2.0) == []
+
+
+async def test_spread_test_books_share_data(cfg):
+    cfg.spread_tests_bps = "4,8"
+    fm, eng = _engine(cfg)
+    assert [b.name for b in eng.books] == ["main", "spread_4bps", "spread_8bps"]
+    for _ in range(900):
+        await eng.tick(now=fm.step())
+    main, w4, w8 = eng.books
+    # wider book quotes further from the price (when both sides are up)
+    if main.orders["bid"] and w8.orders["bid"]:
+        assert w8.orders["bid"].px < main.orders["bid"].px
+    rows = eng.store.db.execute("SELECT book, COUNT(*) FROM fills GROUP BY book").fetchall()
+    assert dict(rows).get("main", 0) > 0
+    stats = eng.store.db.execute("SELECT DISTINCT book FROM book_stats").fetchall()
+    assert {r[0] for r in stats} == {"main", "spread_4bps", "spread_8bps"}
+    assert len(eng.status["books"]) == 3
+    # only ONE judgment per tick, whatever the number of books
+    assert eng.store.db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 900
+
+
+def test_old_database_gets_book_column(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE fills (ts REAL, side TEXT, px REAL, sz REAL, fee REAL, maker INTEGER, mid REAL)")
+    db.execute("INSERT INTO fills VALUES (1, 'bid', 100, 1, 0.01, 1, 100)")
+    db.commit()
+    db.close()
+    s = Store(path)
+    assert s.volume_since("main", 0) == [(1.0, 100.0)]              # old rows count as the main book
